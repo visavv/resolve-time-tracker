@@ -44,8 +44,9 @@ guess. When the job is done, one click exports an invoice-ready spreadsheet.
 
 You only need one file: **`Time Tracker.lua`**.
 
-1. Download it: on this page, click **Code > Download ZIP** and extract it, or
-   grab `Time Tracker.lua` from the latest release.
+1. Download the zip from the
+   [latest release](https://github.com/visavv/resolve-time-tracker/releases/latest)
+   (or click **Code > Download ZIP** on this page) and extract it.
 2. Install it with **one** of the options below.
 3. Restart DaVinci Resolve.
 4. Open it from **Workspace > Scripts > Time Tracker**.
