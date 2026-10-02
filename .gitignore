@@ -1,0 +1,16 @@
+# Local tracker data and test output
+.resolve_time_tracker/
+test-data/
+*.csv
+*.lua.bak
+*.lua.tmp
+live.lua
+instance.lock
+raise.request
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
