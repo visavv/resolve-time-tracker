@@ -10,10 +10,14 @@
 #   Preferences > System > General > External scripting using: Local
 # Log: %LOCALAPPDATA%\ResolveTimeTracker\autostart.log
 param(
-    [string]$Script = "$env:APPDATA\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility\Time Tracker.lua",
+    # A Resolve path map (resolved by Resolve itself, so a non-ASCII user name
+    # never passes through a command line) or a full path for testing.
+    [string]$Script = 'Scripts:/Utility/Time Tracker.lua',
     [int]$PollSeconds = 5
 )
 $ErrorActionPreference = 'Continue'
+$MaxLaunchAttempts = 3
+$IdlePollSeconds = 60   # once scripting looks unavailable for this Resolve
 
 $stateDir = Join-Path $env:LOCALAPPDATA 'ResolveTimeTracker'
 New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
@@ -40,55 +44,94 @@ function Invoke-Lua([string]$fuscript, [string]$code) {
     $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true
     $p = [System.Diagnostics.Process]::Start($info)
-    $read = $p.StandardOutput.ReadToEndAsync()
-    if (-not $p.WaitForExit(20000)) {
-        try { $p.Kill() } catch {}
-        Write-Log 'scripting call timed out'
-        return $null
+    try {
+        $read = $p.StandardOutput.ReadToEndAsync()
+        if (-not $p.WaitForExit(20000)) {
+            try { $p.Kill() } catch {}
+            Write-Log 'scripting call timed out'
+            return $null
+        }
+        return $read.Result
     }
-    return $read.Result
+    finally { $p.Dispose() }
+}
+
+# fuscript ships next to Resolve.exe. An elevated Resolve hides its path from
+# this (non-elevated) helper, so fall back to the default install location.
+function Get-Fuscript($resolve) {
+    if ($resolve.Path) { return Join-Path (Split-Path -Parent $resolve.Path) 'fuscript.exe' }
+    return Join-Path $env:ProgramFiles 'Blackmagic Design\DaVinci Resolve\fuscript.exe'
 }
 
 Write-Log "helper started (script: $Script)"
-$launchedFor = 0      # Resolve process ID the tracker was opened for
-$warnedNoProject = $false
+$session = ''          # Resolve process ID + start time: one Resolve session
+$done = $false         # tracker opened (or given up on) for $session
+$attempts = 0
+$since = $null         # when this Resolve session was first seen
+$warned = $false
+$escapedScript = $Script.Replace(']]', '')  # long-bracket safety; paths never contain ]]
 
 while ($true) {
+    $all = @(Get-Process -Name Resolve -ErrorAction SilentlyContinue)
     # Require Resolve's main window: this skips a Resolve that is starting up
     # or stuck without a window, where a tracker would count unseen time.
-    $resolve = Get-Process -Name Resolve -ErrorAction SilentlyContinue |
-        Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
+    $resolve = $all | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
+    $delay = $PollSeconds
 
-    if (-not (Get-Process -Name Resolve -ErrorAction SilentlyContinue)) {
-        if ($launchedFor) { Write-Log 'Resolve closed' }
-        $launchedFor = 0
-        $warnedNoProject = $false
+    if ($all.Count -eq 0) {
+        if ($session) { Write-Log 'Resolve closed' }
+        $session = ''
     }
-    elseif ($resolve -and $resolve.Id -ne $launchedFor) {
-        $fuscript = Join-Path (Split-Path -Parent $resolve.Path) 'fuscript.exe'
-        if (-not (Test-Path -LiteralPath $Script) -or -not (Test-Path -LiteralPath $fuscript)) {
-            Write-Log "not found: $(if (Test-Path -LiteralPath $Script) { $fuscript } else { $Script })"
-            $launchedFor = $resolve.Id
+    elseif ($resolve) {
+        $started = 0
+        try { $started = $resolve.StartTime.Ticks } catch {}  # access denied if elevated
+        $key = "$($resolve.Id)/$started"
+        if ($key -ne $session) {
+            $session = $key; $done = $false; $attempts = 0; $since = Get-Date; $warned = $false
         }
-        else {
-            # GetCurrentPage is empty while the Project Manager is showing.
-            $out = Invoke-Lua $fuscript "local r = bmd.scriptapp('Resolve'); print('TT_PAGE=' .. tostring(r and r:GetCurrentPage()))"
-            if ($out -match 'TT_PAGE=(\w+)' -and $Matches[1] -ne 'nil') {
-                $page = $Matches[1]
-                # Run inside Resolve, like the Scripts menu: the tracker belongs
-                # to Resolve and closes with it. A tracker that is already open
-                # just comes to the front.
-                $run = Invoke-Lua $fuscript "bmd.scriptapp('Resolve'):Fusion():RunScript([[$Script]]); print('TT_LAUNCHED')"
-                $launchedFor = $resolve.Id
-                if ($run -match 'TT_LAUNCHED') { Write-Log "opened tracker for Resolve $($resolve.Id) (page: $page)" }
-                else { Write-Log 'asking Resolve to run the tracker failed' }
+        if (-not $done) {
+            $fuscript = Get-Fuscript $resolve
+            if (-not (Test-Path -LiteralPath $fuscript)) {
+                Write-Log "fuscript not found: $fuscript"
+                $done = $true
             }
-            elseif (-not $warnedNoProject -and $resolve.StartTime -lt (Get-Date).AddMinutes(-3)) {
-                Write-Log ('no project visible to scripting after 3 minutes. If a project is open, ' +
-                    'set Preferences > System > General > External scripting using: Local (Resolve Studio)')
-                $warnedNoProject = $true
+            else {
+                # GetCurrentPage is empty while the Project Manager is showing.
+                $out = Invoke-Lua $fuscript "local r = bmd.scriptapp('Resolve'); print('TT_PAGE=' .. tostring(r and r:GetCurrentPage()))"
+                if ($out -match 'TT_PAGE=(\w+)' -and $Matches[1] -ne 'nil') {
+                    $page = $Matches[1]
+                    # Run inside Resolve, like the Scripts menu: the tracker belongs
+                    # to Resolve and closes with it. If one is already open it just
+                    # comes to the front, so retrying is harmless.
+                    $run = Invoke-Lua $fuscript ("local f = bmd.scriptapp('Resolve'):Fusion(); " +
+                        "local p = f:MapPath([[$escapedScript]]); " +
+                        "if bmd.fileexists(p) then f:RunScript([[$escapedScript]]); print('TT_LAUNCHED') " +
+                        "else print('TT_MISSING ' .. tostring(p)) end")
+                    $attempts++
+                    if ($run -match 'TT_LAUNCHED') {
+                        Write-Log "opened tracker for Resolve $($resolve.Id) (page: $page)"
+                        $done = $true
+                    }
+                    elseif ($run -match 'TT_MISSING (.+)') {
+                        Write-Log "tracker script not installed: $($Matches[1].Trim()). Run install.ps1."
+                        $done = $true
+                    }
+                    elseif ($attempts -ge $MaxLaunchAttempts) {
+                        Write-Log "could not open the tracker after $attempts attempts; will try again next Resolve session"
+                        $done = $true
+                    }
+                    else { Write-Log "opening the tracker failed (attempt $attempts); retrying" }
+                }
+                elseif ((Get-Date) -gt $since.AddMinutes(3)) {
+                    if (-not $warned) {
+                        Write-Log ('no project visible to scripting after 3 minutes. If a project is open, ' +
+                            'set Preferences > System > General > External scripting using: Local (Resolve Studio)')
+                        $warned = $true
+                    }
+                    $delay = $IdlePollSeconds
+                }
             }
         }
     }
-    Start-Sleep -Seconds $PollSeconds
+    Start-Sleep -Seconds $delay
 }

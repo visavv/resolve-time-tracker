@@ -35,18 +35,29 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot "Time Tracker.lua") -Destination
 Write-Host "Installed to: $dest"
 
 # Right-click > Run with PowerShell passes no switches: ask, and keep the
-# window open at the end so the result can be read.
+# window open at the end so the result can be read. Never block a scripted run.
 $asked = $false
-if (-not $Autostart -and -not $NoAutostart -and [Environment]::UserInteractive) {
+$nonInteractive = [Environment]::GetCommandLineArgs() -match '^-NonI'
+if (-not $Autostart -and -not $NoAutostart -and [Environment]::UserInteractive -and -not $nonInteractive) {
     $asked = $true
-    $answer = Read-Host 'Open Time Tracker automatically whenever DaVinci Resolve opens a project? (Resolve Studio) [y/N]'
-    $Autostart = $answer -match '^\s*y'
+    try {
+        $answer = Read-Host 'Open Time Tracker automatically whenever DaVinci Resolve opens a project? (Resolve Studio) [y/N]'
+        $Autostart = $answer -match '^\s*y'
+    }
+    catch { $asked = $false }
+}
+
+$helperSource = Join-Path $PSScriptRoot 'autostart\TimeTracker-Autostart.ps1'
+if ($Autostart -and -not (Test-Path -LiteralPath $helperSource)) {
+    # Checked before touching a running helper, so a partial download changes nothing.
+    Write-Host "Auto-open needs $helperSource. Download the full release zip and run install.ps1 from it."
+    $Autostart = $false
 }
 
 if ($Autostart) {
     Stop-Helper
     New-Item -ItemType Directory -Force -Path $helperDir | Out-Null
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'autostart\TimeTracker-Autostart.ps1') -Destination $helper -Force
+    Copy-Item -LiteralPath $helperSource -Destination $helper -Force
     $shell = New-Object -ComObject WScript.Shell
     $link = $shell.CreateShortcut($shortcut)
     $link.TargetPath = $powershell

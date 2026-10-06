@@ -43,7 +43,9 @@ guess. When the job is done, one click exports an invoice-ready spreadsheet.
 
 ## Installation
 
-You only need one file: **`Time Tracker.lua`**.
+The tracker itself is one file, **`Time Tracker.lua`**. The optional auto-open
+helper for Windows also needs `install.ps1` and the `autostart` folder, which
+are in the same zip.
 
 1. Download the zip from the
    [latest release](https://github.com/visavv/resolve-time-tracker/releases/latest)
@@ -198,8 +200,9 @@ failed, and retries every second.
 - The tracker counts time while its window is open. With auto-open and
   auto-start on, opening a project is all it takes.
 - Quitting Resolve while tracking is fine: the session is saved as Resolve
-  closes. If Resolve crashes instead, the session is recovered next time and
-  marked `(recovered: Resolve closed while tracking)`.
+  closes. If something stops the tracker unexpectedly instead (a crash, power
+  loss, a file locked during the save), the session is recovered the next time
+  the tracker opens and marked `(recovered after an unexpected stop)`.
 - Idle detection reads system-wide input through Resolve's built-in LuaJIT
   (`GetLastInputInfo` on Windows, `CGEventSourceSecondsSinceLastEventType` on
   macOS). On other systems the tracker still works but won't auto-stop.
@@ -237,6 +240,11 @@ These integration checks need Resolve running with a project open:
 
 Both self-tests require `TT_DATA_DIR` pointing at a disposable folder and
 refuse to run without it, so they can't touch your real history.
+
+Release zip: build it with `tar -a -c -f <name>.zip` (Windows PowerShell 5.1's
+`Compress-Archive` writes backslash paths that break unzip on macOS) and include
+`Time Tracker.lua`, `install.ps1`, `autostart/`, `README.md` and `LICENSE`.
+Upload it as a zip: GitHub renames spaces in individual asset names.
 
 Things worth knowing if you hack on it:
 
