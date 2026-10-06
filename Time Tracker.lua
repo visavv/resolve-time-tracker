@@ -269,6 +269,26 @@ settings.rate     = nonnegative(settings.rate, 100.00)
 settings.currency = settings.currency or "€"
 settings.idleMin  = nonnegative(settings.idleMin, 10)
 settings.autoStart = settings.autoStart == true
+-- Each project remembers the rate and currency it was last tracked with, so
+-- switching between clients never bills one client at another's rate.
+do
+    local clean = {}
+    if type(settings.projectRates) == "table" then
+        for name, r in pairs(settings.projectRates) do
+            local rate = type(r) == "table" and nonnegative(r.rate)
+            if type(name) == "string" and rate and type(r.currency) == "string" then
+                clean[name] = { rate = rate, currency = r.currency }
+            end
+        end
+    end
+    settings.projectRates = clean
+end
+
+local function rateFor(projName)
+    local r = settings.projectRates[projName]
+    if r then return r.rate, r.currency end
+    return settings.rate, settings.currency
+end
 
 local sessions = loadTable(SESSIONS_FILE) or {}
 -- Claim the instance only once saved data has loaded; a load error must not
@@ -360,10 +380,12 @@ local function startSession(projName, startTs)
     if sess then return false end
     local now = startTs or os.time()
     pendingSwitch = nil
+    projName = projName or currentProjectName()
+    local rate, currency = rateFor(projName)
     sess = {
-        id = newId(), project = projName or currentProjectName(),
+        id = newId(), project = projName,
         startTs = now, lastTs = now, lastPage = currentPage(),
-        seconds = 0, rate = settings.rate, currency = settings.currency,
+        seconds = 0, rate = rate, currency = currency,
         note = "", pages = {}, segments = {},
     }
     state = "running"
@@ -897,10 +919,31 @@ local function refreshPages()
     end
 end
 
+-- Show the rate that applies: the running session's, else the one the open
+-- project was last tracked with. An unknown project keeps the last-used rate.
+local rateShownFor = nil
+local function showProjectRate(projName)
+    rateShownFor = projName
+    local rate, currency
+    if sess and sess.project == projName then
+        rate, currency = sess.rate, sess.currency
+    elseif settings.projectRates[projName] then
+        rate, currency = rateFor(projName)
+    else
+        return
+    end
+    itm.RateEdit.Text = fmtMoney(rate)
+    for i, c in ipairs(CURRENCIES) do
+        if c == currency then itm.CurCombo.CurrentIndex = i - 1 end
+    end
+end
+
 local lastStorageStatus = nil
 local function refreshUI()
     local projName = currentProjectName()
     if historyProject ~= projName then refreshHistory() end
+    local rateProject = sess and sess.project or projName
+    if rateShownFor ~= rateProject then showProjectRate(rateProject) end
     setProp("ProjectLbl", "Text", projName)
     setProp("TimeLbl", "Text", fmtHMS(sess and sess.seconds or 0))
     setProp("TotalLbl", "Text", fmtHMS(projectTotalSeconds(projName)))
@@ -950,6 +993,11 @@ local function pullSettings(lenient, quiet)
     settings.currency = CURRENCIES[itm.CurCombo.CurrentIndex + 1] or settings.currency
     settings.idleMin = idleMin or settings.idleMin
     settings.autoStart = itm.AutoStartChk.Checked and true or false
+    if not lenient then
+        -- Start: this is now the rate for the open project.
+        settings.projectRates[currentProjectName()] =
+            { rate = settings.rate, currency = settings.currency }
+    end
     if not saveSettings() then
         if not quiet then refreshUI() end
         return false

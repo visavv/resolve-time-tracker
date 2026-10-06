@@ -27,8 +27,9 @@ guess. When the job is done, one click exports an invoice-ready spreadsheet.
 - **Opens with Resolve (optional, Windows).** The tracker can pop up on its own
   whenever you open a project. Tick **Start tracking automatically** too and
   there's nothing left to remember.
-- **Rates and earnings.** Hourly rate plus currency. Each session keeps the rate
-  it was tracked at, so changing your rate mid-project bills every hour
+- **Rates and earnings.** Hourly rate plus currency, remembered per project, so
+  switching between clients brings back each client's rate. Each session keeps
+  the rate it was tracked at, so changing your rate mid-project bills every hour
   correctly. Different currencies are totalled separately, never converted.
 - **Invoice-ready CSV export.** Exports every project at once, grouped by
   project with each day's sessions stacked underneath, a subtotal per project,
