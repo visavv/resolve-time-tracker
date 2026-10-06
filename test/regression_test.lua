@@ -90,7 +90,7 @@ local function boot(disk, scenario, options)
                     SetData=function(self,_,role,v) self.data[role]=v end,
                     GetData=function(self,_,role) return self.data[role] end} end
                 props.SetHeaderItem=function() end
-                props.Clear=function(self) self.rows={}; self.selected=nil end
+                props.Clear=function(self) self.rows={}; self.selected=nil; c.treeClears=(c.treeClears or 0)+1 end
                 props.AddTopLevelItem=function(self,row) self.rows[#self.rows+1]=row end
                 props.CurrentItem=function(self) return self.selected end
             elseif kind == "Timer" then props.Start=function() end; props.Stop=function() end end
@@ -104,10 +104,12 @@ local function boot(disk, scenario, options)
         end
     end})
     local win={On=setmetatable({}, {__index=function(t,k) local v={}; rawset(t,k,v); return v end}),
-        GetItems=function() return c.items end, Show=function() end, Hide=function() end,
+        GetItems=function() return c.items end, Show=function() end,
+        Hide=function() c.hides=(c.hides or 0)+1 end,
         Raise=function() c.raised=(c.raised or 0)+1 end, ActivateWindow=function() end}
     local disp={On={},AddWindow=function() return win end,ExitLoop=function() c.exits=c.exits+1 end}
     c.click=function(id) win.On[id].Clicked({}) end
+    c.closeWindow=function() win.On.ttwin.Close({}) end
     c.tick=function() disp.On.Timeout({who="Ticker"}) end
     c.history=function() return c.items.HistTree.rows end
     disp.RunLoop=function() scenario(c) end
@@ -308,6 +310,24 @@ test("history rows keep session IDs out of the visible columns",function()
         check(row.Text[4]==nil)
     end)
 end)
+test("closing the window (X or Resolve quitting) never touches it again",function()
+    -- Hiding or redrawing a window Resolve is tearing down makes Resolve
+    -- abandon its quit and linger without a window (verified live).
+    local c=boot(nil,function(c)
+        c.click("StartBtn"); c.now=c.now+30; c.tick()
+        c.hides=0; local clears=c.treeClears
+        c.closeWindow()
+        eq(c.exits,1); eq(c.hides,0,"no Hide during close"); eq(c.treeClears,clears,"no redraw during close")
+        eq(saved(c,"sessions.lua")[1].seconds,30,"session still saved")
+    end)
+    eq(c.hides,0,"no Hide after the loop ends either")
+end)
+test("the Close button hides the window and saves",function()
+    boot(nil,function(c)
+        runFor(c,10); c.hides=0; c.click("CloseBtn")
+        eq(c.exits,1); eq(c.hides,1); eq(#saved(c,"sessions.lua"),1)
+    end)
+end)
 test("Open Folder opens the data folder",function()
     boot(nil,function(c) c.click("FolderBtn"); eq(c.opened.path,dir) end)
 end)
@@ -401,6 +421,9 @@ test("notes survive crash recovery",function()
     boot(disk,function(c)
         local session=saved(c,"sessions.lua")[1]
         eq(session.seconds,20); check(session.note:find("Keep this note",1,true))
+        -- Quitting Resolve mid-session is normal with auto-launch: no "crash" claim.
+        check(session.note:find("(recovered: Resolve closed while tracking)",1,true))
+        check(not session.note:find("crash",1,true))
     end)
 end)
 test("export includes running session and does not overwrite same-second exports",function()

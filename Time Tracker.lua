@@ -402,6 +402,7 @@ local function trimAfter(cutoff)
 end
 
 local refreshHistory
+local closingWindow = false -- set by shutdown(); see there
 
 local function closeSession(extraNote, endTs)
     if not sess then return true end
@@ -425,7 +426,7 @@ local function closeSession(extraNote, endTs)
     sess = nil
     state = "idle"
     removeLive()
-    if refreshHistory then refreshHistory() end
+    if refreshHistory and not closingWindow then refreshHistory() end
     return true
 end
 
@@ -448,13 +449,16 @@ do
     if live and (tonumber(live.seconds) or 0) > 0 and not duplicate then
         live.id = live.id or newId()
         live.endTs = live.endTs or live.savedAt or (live.startTs + live.seconds)
+        -- Quitting Resolve while tracking ends here too, not only a crash, so
+        -- the note must not claim a crash on an invoice.
         local note = live.note or ""
-        if not note:find("(recovered after crash)", 1, true) then
-            live.note = (note ~= "" and (note .. " ") or "") .. "(recovered after crash)"
+        if not note:find("(recovered", 1, true) then
+            live.note = (note ~= "" and (note .. " ") or "") .. "(recovered: Resolve closed while tracking)"
         end
         sess = live
         if closeSession() then
-            recoveredNotice = "Recovered a crashed session: " .. fmtHMS(live.seconds)
+            recoveredNotice = "Saved the session that was running when Resolve closed: "
+                .. fmtHMS(live.seconds)
         end
     else
         removeLive()
@@ -1093,19 +1097,24 @@ function win.On.DeleteBtn.Clicked(ev)
     itm.StatusLbl.Text = "Could not match that session."
 end
 
-local function shutdown()
+-- byWindowClose: the window's X, or Resolve closing every script window as it
+-- quits. Touching the window after that (redraws, Hide) makes Resolve abandon
+-- the quit and linger without a window, which blocks reopening it.
+local function shutdown(byWindowClose)
+    closingWindow = byWindowClose
     if sess then
         if not sess.endTs then sess.note = itm.NoteEdit.Text or "" end
         -- History must be safe before the window may close.
-        if not closeSession() then refreshUI(); return end
+        if not closeSession() then closingWindow = false; refreshUI(); return end
     end
     pullSettings(true)
     ticker:Stop()
+    if not byWindowClose then win:Hide() end
     disp:ExitLoop()
 end
 
-function win.On.CloseBtn.Clicked(ev) shutdown() end
-function win.On.ttwin.Close(ev) shutdown() end
+function win.On.CloseBtn.Clicked(ev) shutdown(false) end
+function win.On.ttwin.Close(ev) shutdown(true) end
 
 -- ---------------------------------------------------------------------------
 -- Go
@@ -1163,5 +1172,6 @@ end
 
 ticker:Start()
 disp:RunLoop()
-win:Hide()
+-- No win:Hide() here: shutdown() already hid the window if it should; calling
+-- into it now would stall Resolve's quit (see shutdown).
 os.remove(LOCK_FILE) -- RunLoop only returns after a clean shutdown
