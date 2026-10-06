@@ -328,6 +328,22 @@ test("the Close button hides the window and saves",function()
         eq(c.exits,1); eq(c.hides,1); eq(#saved(c,"sessions.lua"),1)
     end)
 end)
+test("CSV text cells cannot run as spreadsheet formulas",function()
+    boot(nil,function(c)
+        c.project='=HYPERLINK("http://x","click")'
+        c.click("StartBtn"); c.items.NoteEdit.Text="+cmd|' /C calc'!A0"; c.now=c.now+60; c.click("StartBtn")
+        c.project="@SUM(1)"; runFor(c,60)
+        c.click("ExportBtn")
+        local csv=c.disk[c.items.StatusLbl.Text:sub(#"Exported: "+1)]
+        for line in csv:gmatch("[^\r\n]+") do
+            for cell in (line..","):gmatch('("?[^,]*"?),') do
+                check(not cell:find('^"?[=+@]'),"formula-like cell: "..cell)
+            end
+        end
+        check(csv:find([["'=HYPERLINK(""http://x"",""click"")"]],1,true),"kept as text, readable")
+        check(csv:find("'@SUM(1)",1,true))
+    end)
+end)
 test("Open Folder opens the data folder",function()
     boot(nil,function(c) c.click("FolderBtn"); eq(c.opened.path,dir) end)
 end)

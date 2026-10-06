@@ -555,8 +555,12 @@ end
 -- ---------------------------------------------------------------------------
 -- CSV export
 -- ---------------------------------------------------------------------------
+-- Text cells only (project, note, currency). Spreadsheets run a cell that
+-- starts with = + - @ (or tab/CR) as a formula, and exports go to clients, so
+-- a leading apostrophe keeps such text as text (OWASP CSV injection advice).
 local function csvField(v)
     v = tostring(v or "")
+    if v:find("^[=+%-@\t\r]") then v = "'" .. v end
     if v:find('[",\r\n]') then v = '"' .. v:gsub('"', '""') .. '"' end
     return v
 end

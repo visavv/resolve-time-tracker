@@ -123,7 +123,11 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Autostart
 Turn it off again with `-RemoveAutostart` (the tracker itself stays installed).
 
 It needs **DaVinci Resolve Studio** with **Preferences > System > General >
-External scripting using** set to **Local**. If the tracker doesn't appear, the
+External scripting using** set to **Local**. Be aware that this Resolve setting
+lets any program running on your computer control Resolve through its scripting
+API (never other computers; that would be the *Network* option). Leave it off if
+you don't want that; the tracker still works from the Scripts menu without it.
+If the tracker doesn't appear, the
 helper's log at `%LOCALAPPDATA%\ResolveTimeTracker\autostart.log` says why. The
 helper shows up as *Time Tracker for DaVinci Resolve* in Task Manager's Startup
 apps.
