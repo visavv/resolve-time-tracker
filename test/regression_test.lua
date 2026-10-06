@@ -19,6 +19,11 @@ local function decode(text)
     local chunk = assert(compile(text)); setfenv(chunk, {}); return chunk()
 end
 local function saved(c, name) return decode(c.disk[path(name)]) end
+-- The status names the exported file; it lives in the data folder.
+local function exported(c)
+    local name = c.items.StatusLbl.Text:match("(Time_Tracker_[%w_]+%.csv)")
+    return name and path(name)
+end
 
 local function boot(disk, scenario, options)
     options = options or {}
@@ -295,7 +300,7 @@ end)
 test("CSV starts with a UTF-8 BOM so Excel shows currency symbols",function()
     boot(nil,function(c)
         runFor(c,60); c.click("ExportBtn")
-        local csv=c.disk[c.items.StatusLbl.Text:sub(#"Exported: "+1)]
+        local csv=c.disk[exported(c)]
         eq(csv:sub(1,3),"\239\187\191"); check(csv:find("€",1,true))
         check(not csv:find("\226\128\148",1,true),"no em dashes in exported text")
     end)
@@ -322,6 +327,47 @@ test("closing the window (X or Resolve quitting) never touches it again",functio
     end)
     eq(c.hides,0,"no Hide after the loop ends either")
 end)
+test("a failed save while Resolve quits still closes untouched; next open recovers",function()
+    local disk={}
+    boot(disk,function(c)
+        c.click("StartBtn"); c.now=c.now+30; c.tick()
+        c.faults.write=path("sessions.lua.tmp")
+        local status,btn=c.items.StatusLbl.Text,c.items.StartBtn.Text
+        c.hides=0; c.closeWindow()
+        eq(c.exits,1,"must not keep a window Resolve is closing")
+        eq(c.hides,0); eq(c.items.StatusLbl.Text,status,"no redraw"); eq(c.items.StartBtn.Text,btn,"no redraw")
+        check(c.disk[path("live.lua")],"session kept for recovery")
+        c.faults.write=nil
+    end)
+    boot(disk,function(c)
+        local s=saved(c,"sessions.lua")[1]
+        eq(s.seconds,30); check(s.note:find("(recovered",1,true))
+    end)
+end)
+test("a failed settings save while Resolve quits does not redraw",function()
+    boot(nil,function(c)
+        c.faults.write=path("settings.lua.tmp")
+        local status=c.items.StatusLbl.Text
+        c.closeWindow(); eq(c.exits,1); eq(c.items.StatusLbl.Text,status)
+    end)
+end)
+test("recovered sessions do not claim a cause that did not happen",function()
+    local disk={}
+    boot(disk,function(c) c.click("StartBtn"); c.now=c.now+20; c.tick() end) -- process dies here
+    boot(disk,function(c)
+        local note=saved(c,"sessions.lua")[1].note
+        eq(note,"(recovered after an unexpected stop)")
+    end)
+end)
+test("export status names the file instead of a long clipped path",function()
+    boot(nil,function(c)
+        runFor(c,60); c.click("ExportBtn")
+        local text=c.items.StatusLbl.Text
+        check(text:find("^Exported Time_Tracker_[%w_]+%.csv"),text)
+        check(not text:find(dir,1,true),"no folder path in the status")
+        check(c.disk[exported(c)],"named file exists")
+    end)
+end)
 test("the Close button hides the window and saves",function()
     boot(nil,function(c)
         runFor(c,10); c.hides=0; c.click("CloseBtn")
@@ -334,7 +380,7 @@ test("CSV text cells cannot run as spreadsheet formulas",function()
         c.click("StartBtn"); c.items.NoteEdit.Text="+cmd|' /C calc'!A0"; c.now=c.now+60; c.click("StartBtn")
         c.project="@SUM(1)"; runFor(c,60)
         c.click("ExportBtn")
-        local csv=c.disk[c.items.StatusLbl.Text:sub(#"Exported: "+1)]
+        local csv=c.disk[exported(c)]
         for line in csv:gmatch("[^\r\n]+") do
             for cell in (line..","):gmatch('("?[^,]*"?),') do
                 check(not cell:find('^"?[=+@]'),"formula-like cell: "..cell)
@@ -378,7 +424,7 @@ test("earnings and CSV totals separate currencies",function()
         check(c.items.EarnLbl.Text:find("$ 100.00",1,true))
         check(not c.items.EarnLbl.Text:find("200.00",1,true))
         c.click("ExportBtn")
-        local csv=c.disk[c.items.StatusLbl.Text:sub(#"Exported: "+1)]
+        local csv=c.disk[exported(c)]
         check(csv:find("TOTAL (all projects),,,,,,,$,100.00",1,true))
         check(csv:find("TOTAL (all projects),,,,,,,€,100.00",1,true))
     end)
@@ -437,17 +483,15 @@ test("notes survive crash recovery",function()
     boot(disk,function(c)
         local session=saved(c,"sessions.lua")[1]
         eq(session.seconds,20); check(session.note:find("Keep this note",1,true))
-        -- Quitting Resolve mid-session is normal with auto-launch: no "crash" claim.
-        check(session.note:find("(recovered: Resolve closed while tracking)",1,true))
-        check(not session.note:find("crash",1,true))
+        check(session.note:find("(recovered after an unexpected stop)",1,true))
     end)
 end)
 test("export includes running session and does not overwrite same-second exports",function()
     boot(nil,function(c)
         c.click("StartBtn"); c.now=c.now+10; c.click("ExportBtn")
-        local first=c.items.StatusLbl.Text:sub(#"Exported: "+1)
+        local first=exported(c)
         check(c.disk[first]:find("(in progress)",1,true)); check(c.disk[first]:find("0:00:10",1,true))
-        c.click("ExportBtn"); local second=c.items.StatusLbl.Text:sub(#"Exported: "+1)
+        c.click("ExportBtn"); local second=exported(c)
         check(first~=second); check(c.disk[first]); check(c.disk[second])
         eq(c.items.StartBtn.Text,"Stop")
     end)
@@ -497,7 +541,7 @@ test("failed CSV writes report failure",function()
     boot(nil,function(c)
         runFor(c,10)
         c.faults.write=path(realDate("Time_Tracker_%Y%m%d_%H%M%S",c.now)..".csv")
-        c.click("ExportBtn"); eq(c.items.StatusLbl.Text,"Export failed.")
+        c.click("ExportBtn"); check(c.items.StatusLbl.Text:find("^Export failed%."),c.items.StatusLbl.Text)
     end)
 end)
 

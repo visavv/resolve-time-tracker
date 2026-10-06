@@ -449,15 +449,16 @@ do
     if live and (tonumber(live.seconds) or 0) > 0 and not duplicate then
         live.id = live.id or newId()
         live.endTs = live.endTs or live.savedAt or (live.startTs + live.seconds)
-        -- Quitting Resolve while tracking ends here too, not only a crash, so
-        -- the note must not claim a crash on an invoice.
+        -- A normal close (even Resolve quitting) saves the session itself, so
+        -- this is a crash, a killed process, power loss, or a save that failed
+        -- while Resolve closed the window. Don't name a cause on the invoice.
         local note = live.note or ""
         if not note:find("(recovered", 1, true) then
-            live.note = (note ~= "" and (note .. " ") or "") .. "(recovered: Resolve closed while tracking)"
+            live.note = (note ~= "" and (note .. " ") or "") .. "(recovered after an unexpected stop)"
         end
         sess = live
         if closeSession() then
-            recoveredNotice = "Saved the session that was running when Resolve closed: "
+            recoveredNotice = "Recovered a session that was still running when the tracker last stopped: "
                 .. fmtHMS(live.seconds)
         end
     else
@@ -926,7 +927,8 @@ end
 -- ---------------------------------------------------------------------------
 -- lenient = true keeps the last valid value for any invalid field instead of
 -- refusing; used when closing, so a typo can never trap the window open.
-local function pullSettings(lenient)
+-- quiet = true never redraws (the window may be closing; see shutdown).
+local function pullSettings(lenient, quiet)
     local rate = nonnegative(itm.RateEdit.Text)
     local idleMin = nonnegative(itm.IdleEdit.Text)
     if not lenient and (not rate or not idleMin) then
@@ -937,7 +939,10 @@ local function pullSettings(lenient)
     settings.currency = CURRENCIES[itm.CurCombo.CurrentIndex + 1] or settings.currency
     settings.idleMin = idleMin or settings.idleMin
     settings.autoStart = itm.AutoStartChk.Checked and true or false
-    if not saveSettings() then refreshUI(); return false end
+    if not saveSettings() then
+        if not quiet then refreshUI() end
+        return false
+    end
     return true
 end
 
@@ -1045,7 +1050,11 @@ end
 function win.On.ExportBtn.Clicked(ev)
     if state == "running" then tick() end
     local path = exportCSV()
-    itm.StatusLbl.Text = path and ("Exported: " .. path) or "Export failed."
+    -- A full path has no spaces to wrap on and gets clipped; name the file and
+    -- point at Open Folder instead.
+    itm.StatusLbl.Text = path
+        and ("Exported " .. path:match("[^\\/]+$") .. ". Open Folder shows it.")
+        or "Export failed. Check disk space and permissions."
 end
 
 function win.On.FolderBtn.Clicked(ev)
@@ -1108,10 +1117,15 @@ local function shutdown(byWindowClose)
     closingWindow = byWindowClose
     if sess then
         if not sess.endTs then sess.note = itm.NoteEdit.Text or "" end
-        -- History must be safe before the window may close.
-        if not closeSession() then closingWindow = false; refreshUI(); return end
+        if not closeSession() and not byWindowClose then
+            -- Close button: keep the window open and retry the save.
+            refreshUI()
+            return
+        end
+        -- Closing by X or with Resolve: the window cannot stay. A session whose
+        -- history save failed is frozen in live.lua and recovered next time.
     end
-    pullSettings(true)
+    pullSettings(true, byWindowClose)
     ticker:Stop()
     if not byWindowClose then win:Hide() end
     disp:ExitLoop()
