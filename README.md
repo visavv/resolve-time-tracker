@@ -24,8 +24,9 @@ guess. When the job is done, one click exports an invoice-ready spreadsheet.
   step away longer than your idle limit (default 10 minutes), the session is
   closed at your *last real input*, so coffee breaks never land on the invoice.
   Tracking resumes on its own when you're back.
-- **Auto-start (optional).** Tick one box and tracking starts whenever you open
-  the window.
+- **Opens with Resolve (optional, Windows).** The tracker can pop up on its own
+  whenever you open a project. Tick **Start tracking automatically** too and
+  there's nothing left to remember.
 - **Rates and earnings.** Hourly rate plus currency. Each session keeps the rate
   it was tracked at, so changing your rate mid-project bills every hour
   correctly. Different currencies are totalled separately, never converted.
@@ -54,7 +55,8 @@ You only need one file: **`Time Tracker.lua`**.
 ### Windows, option A: installer script
 
 Right-click **`install.ps1`** and choose **Run with PowerShell**. It copies the
-script into your Resolve scripts folder and tells you where it went.
+script into your Resolve scripts folder and asks whether the tracker should open
+automatically with Resolve (see [Open it automatically](#open-it-automatically-with-resolve-windows)).
 
 If Windows says running scripts is disabled, open PowerShell in the extracted
 folder and run:
@@ -107,12 +109,35 @@ Use the shared folder instead of your personal one:
 | macOS | `/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility` |
 | Linux | `/opt/resolve/Fusion/Scripts/Utility` |
 
+### Open it automatically with Resolve (Windows)
+
+Resolve has no setting to run a script at startup, so the installer can add a
+tiny helper to your Windows Startup folder. It waits in the background and, as
+soon as Resolve opens a project, opens the tracker exactly as the Scripts menu
+would. If you close the tracker, it stays closed until you restart Resolve.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Autostart
+```
+
+Turn it off again with `-RemoveAutostart` (the tracker itself stays installed).
+
+It needs **DaVinci Resolve Studio** with **Preferences > System > General >
+External scripting using** set to **Local**. If the tracker doesn't appear, the
+helper's log at `%LOCALAPPDATA%\ResolveTimeTracker\autostart.log` says why. The
+helper shows up as *Time Tracker for DaVinci Resolve* in Task Manager's Startup
+apps.
+
+To have tracking start the moment the window appears, also tick **Start tracking
+automatically when this window opens** in the tracker.
+
 ### Updating and uninstalling
 
 - **Update:** close the tracker window, replace `Time Tracker.lua` (or rerun
   `install.ps1`), then reopen it. Your tracked time is kept.
-- **Uninstall:** delete `Time Tracker.lua` from the `Utility` folder. Your
-  tracked time stays in the data folder (see below) until you delete that too.
+- **Uninstall:** run `install.ps1 -RemoveAutostart` if you turned auto-open on,
+  then delete `Time Tracker.lua` from the `Utility` folder. Your tracked time
+  stays in the data folder (see below) until you delete that too.
 
 ## Using it
 
@@ -166,8 +191,11 @@ failed, and retries every second.
 
 ## Good to know
 
-- The tracker counts time while its window is open. With auto-start on,
-  opening the window is all it takes.
+- The tracker counts time while its window is open. With auto-open and
+  auto-start on, opening a project is all it takes.
+- Quitting Resolve while tracking is fine: the session is saved as Resolve
+  closes. If Resolve crashes instead, the session is recovered next time and
+  marked `(recovered: Resolve closed while tracking)`.
 - Idle detection reads system-wide input through Resolve's built-in LuaJIT
   (`GetLastInputInfo` on Windows, `CGEventSourceSecondsSinceLastEventType` on
   macOS). On other systems the tracker still works but won't auto-stop.
@@ -214,6 +242,13 @@ Things worth knowing if you hack on it:
   time is recorded under `unknown`.
 - Qt ignores close requests to a script window while a modal Resolve dialog
   (such as Software Update) is open.
+- When Resolve quits it closes every script window. Never call into the window
+  after that (`Hide()`, redraws): Resolve then abandons the quit and lingers
+  without a window, which blocks reopening it. A script window also needs a
+  `Close` handler that exits its loop, or Resolve waits for it forever.
+- Menu scripts run in a child `fuscript -q -l Lua -a <port>` process.
+  `Fusion:RunScript(path)` from an external client launches a script the same
+  way; the auto-open helper relies on that.
 - Force-killing an external `fuscript` process can leave Resolve's external
   scripting server stuck until Resolve restarts. The Workspace > Scripts menu
   is unaffected.
