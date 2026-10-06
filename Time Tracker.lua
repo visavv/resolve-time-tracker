@@ -353,9 +353,13 @@ local function removeLive()
     return true
 end
 
-local function startSession(projName)
+local pendingSwitch = nil -- {name=, at=}: project change seen once, not yet confirmed
+
+-- startTs backdates the start (a confirmed project switch); default now.
+local function startSession(projName, startTs)
     if sess then return false end
-    local now = os.time()
+    local now = startTs or os.time()
+    pendingSwitch = nil
     sess = {
         id = newId(), project = projName or currentProjectName(),
         startTs = now, lastTs = now, lastPage = currentPage(),
@@ -759,8 +763,10 @@ local win = disp:AddWindow({
         ui:HGroup({
             Weight = 0,
             ui:Label({ ID = "RateLbl", Text = "Rate / hr", Weight = 0 }),
-            ui:ComboBox({ ID = "CurCombo", Weight = 0, MinimumSize = { 55, 24 } }),
-            ui:LineEdit({ ID = "RateEdit", Text = fmtMoney(settings.rate), Weight = 1 }),
+            ui:ComboBox({ ID = "CurCombo", Weight = 0, MinimumSize = { 55, 24 },
+                          ToolTip = "Currency for new sessions. Stop tracking to change it." }),
+            ui:LineEdit({ ID = "RateEdit", Text = fmtMoney(settings.rate), Weight = 1,
+                          ToolTip = "Hourly rate for new sessions. Stop tracking to change it." }),
             ui:Label({ ID = "IdleLbl", Text = "  Idle stop (min)", Weight = 0 }),
             ui:LineEdit({ ID = "IdleEdit", Text = tostring(settings.idleMin),
                           Weight = 0, MinimumSize = { 45, 24 } }),
@@ -903,13 +909,18 @@ local function refreshUI()
     local today, week = rangeTotals()
     setProp("AllLbl", "Text", "All projects · Today " .. fmtHMS(today)
         .. " · This week " .. fmtHMS(week))
-    if state == "running" or state == "armed" or state == "saving" then
+    local tracking = state == "running" or state == "armed" or state == "saving"
+    if tracking then
         setProp("StartBtn", "Text", state == "saving" and "Retry save" or "Stop")
         setProp("StartBtn", "StyleSheet", STOP_STYLE)
     else
         setProp("StartBtn", "Text", "Start")
         setProp("StartBtn", "StyleSheet", START_STYLE)
     end
+    -- Rate and currency are fixed per session (read on Start), so editing them
+    -- mid-session would silently do nothing. The idle limit stays live.
+    setProp("RateEdit", "Enabled", not tracking)
+    setProp("CurCombo", "Enabled", not tracking)
     local storageStatus = nil
     for _, message in pairs(storageErrors) do
         storageStatus = message .. ". Check disk space and permissions."
@@ -982,13 +993,27 @@ local function tick()
         if idle.supported and thr > 0 and idleSecs >= thr then
             autoStopIdle(idleSecs, now)
         else
+            -- A switch counts once it is seen on two ticks in a row. Resolve
+            -- unloads the project a moment before it closes script windows on
+            -- quit; acting on that single sighting added a "(project
+            -- switched)" note and a stray one-second "Untitled Project" row.
             local projName = currentProjectName()
-            if projName ~= sess.project then
-                if closeSession("(project switched)") then
-                    itm.NoteEdit.Text = ""
-                    startSession(projName)
-                end
+            if projName == sess.project then
+                pendingSwitch = nil
+            elseif not pendingSwitch or pendingSwitch.name ~= projName then
+                pendingSwitch = { name = projName, at = now }
             else
+                -- Confirmed: move the time since the first sighting to the
+                -- new project, so the split happens when the switch did.
+                local at = pendingSwitch.at
+                trimAfter(at)
+                if closeSession("(project switched)", at) then
+                    itm.NoteEdit.Text = ""
+                    startSession(projName, at)
+                    accountUntil(now)
+                end
+            end
+            if sess and state == "running" then
                 sess.lastPage = currentPage()
                 saveLive()
             end
