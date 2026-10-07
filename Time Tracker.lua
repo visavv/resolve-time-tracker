@@ -1,5 +1,6 @@
 --[[----------------------------------------------------------------------------
-Time Tracker for DaVinci Resolve
+Time Tracker for DaVinci Resolve, version 1.1.0
+https://github.com/visavv/resolve-time-tracker (MIT licence)
 --------------------------------------------------------------------------------
 A single-file time tracker that lives in Workspace > Scripts.
 
@@ -14,8 +15,13 @@ Features:
     last real input ("rewind"), tagged "(auto-stopped: idle)", and tracking
     re-arms: it resumes automatically on the next input.
   - Crash recovery: live session state is written to disk every second
-  - Hourly rate + currency, earnings per session (rate changes are historical)
+  - Hourly rate + currency remembered per project (rate changes are historical)
+  - Flat-fee projects: time budget at your hourly rate and effective hourly rate
+  - Optional: keep counting during renders; pause while Resolve is in the
+    background (Windows)
+  - Add time worked outside Resolve; edit or delete sessions
   - One-click CSV export of all projects (grouped, subtotalled, per-page columns)
+    and a client timesheet (hours and notes only; printable page + CSV)
   - Single instance: opening the script again brings the running window forward
 
 Install:
@@ -253,6 +259,54 @@ do
 end
 
 -- ---------------------------------------------------------------------------
+-- Is Resolve the active app? (optional pause; Windows only for now)
+-- The tracker window belongs to Resolve's process, so it counts as Resolve.
+-- ---------------------------------------------------------------------------
+local focus = { supported = false }
+do
+    local ok, ffi = pcall(require, "ffi")
+    if ok and ffi and ffi.os == "Windows" then
+        pcall(ffi.cdef, [[
+            void* GetForegroundWindow(void);
+            unsigned long GetWindowThreadProcessId(void* hWnd, unsigned long* pid);
+            void* OpenProcess(unsigned long access, int inherit, unsigned long pid);
+            int QueryFullProcessImageNameA(void* process, unsigned long flags, char* name, unsigned long* size);
+            int CloseHandle(void* handle);
+        ]])
+        local okU, user32 = pcall(ffi.load, "user32")
+        local okK, kernel32 = pcall(ffi.load, "kernel32")
+        local okB, pid, name, size = pcall(function()
+            return ffi.new("unsigned long[1]"), ffi.new("char[1024]"), ffi.new("unsigned long[1]")
+        end)
+        if okU and okK and okB then
+            local isResolve, cached = {}, 0 -- process id -> bool
+            local function lookup(id)
+                local handle = kernel32.OpenProcess(0x1000, 0, id) -- QUERY_LIMITED_INFORMATION
+                if handle == nil then return false end
+                size[0] = 1024
+                local found = kernel32.QueryFullProcessImageNameA(handle, 0, name, size) ~= 0
+                    and ffi.string(name, size[0]):lower():find("[\\/]resolve%.exe$") ~= nil
+                kernel32.CloseHandle(handle)
+                return found
+            end
+            focus.supported = true
+            focus.resolveActive = function()
+                local hwnd = user32.GetForegroundWindow()
+                if hwnd == nil then return true end -- no foreground window: don't guess
+                user32.GetWindowThreadProcessId(hwnd, pid)
+                local id = tonumber(pid[0])
+                if isResolve[id] == nil then
+                    if cached >= 64 then isResolve, cached = {}, 0 end -- ids get reused
+                    isResolve[id] = lookup(id)
+                    cached = cached + 1
+                end
+                return isResolve[id]
+            end
+        end
+    end
+end
+
+-- ---------------------------------------------------------------------------
 -- App state
 -- ---------------------------------------------------------------------------
 local PAGES = { "media", "cut", "edit", "fusion", "color", "fairlight", "deliver", "photo" }
@@ -269,25 +323,42 @@ settings.rate     = nonnegative(settings.rate, 100.00)
 settings.currency = settings.currency or "€"
 settings.idleMin  = nonnegative(settings.idleMin, 10)
 settings.autoStart = settings.autoStart == true
--- Each project remembers the rate and currency it was last tracked with, so
--- switching between clients never bills one client at another's rate.
+settings.countRenders = settings.countRenders == true
+settings.pauseInBackground = settings.pauseInBackground == true
+-- Per project: the rate and currency it was last tracked with (so switching
+-- clients never bills one at another's rate) and an optional flat fee.
 do
     local clean = {}
-    if type(settings.projectRates) == "table" then
-        for name, r in pairs(settings.projectRates) do
-            local rate = type(r) == "table" and nonnegative(r.rate)
-            if type(name) == "string" and rate and type(r.currency) == "string" then
-                clean[name] = { rate = rate, currency = r.currency }
+    local function take(source)
+        if type(source) ~= "table" then return end
+        for name, p in pairs(source) do
+            if type(name) == "string" and type(p) == "table" then
+                local entry = clean[name] or {}
+                local rate = nonnegative(p.rate)
+                if rate and type(p.currency) == "string" then
+                    entry.rate, entry.currency = rate, p.currency
+                end
+                local fee = nonnegative(p.fee)
+                if fee and fee > 0 then entry.fee = fee end
+                if next(entry) then clean[name] = entry end
             end
         end
     end
-    settings.projectRates = clean
+    take(settings.projectRates) -- name used by pre-1.1 development builds
+    take(settings.projects)
+    settings.projects = clean
+    settings.projectRates = nil
 end
 
 local function rateFor(projName)
-    local r = settings.projectRates[projName]
-    if r then return r.rate, r.currency end
+    local p = settings.projects[projName]
+    if p and p.rate then return p.rate, p.currency end
     return settings.rate, settings.currency
+end
+
+local function feeFor(projName)
+    local p = settings.projects[projName]
+    return p and p.fee
 end
 
 local sessions = loadTable(SESSIONS_FILE) or {}
@@ -326,6 +397,14 @@ local function currentPage()
     local ok, page = pcall(function() return resolve:GetCurrentPage() end)
     if ok and page and page ~= "" then return page end
     return "unknown"
+end
+
+local function renderingNow()
+    local ok, busy = pcall(function()
+        local proj = pm:GetCurrentProject()
+        return proj and proj:IsRenderingInProgress()
+    end)
+    return ok and busy == true
 end
 
 -- ---------------------------------------------------------------------------
@@ -433,7 +512,13 @@ local closingWindow = false -- set by shutdown(); see there
 local function closeSession(extraNote, endTs)
     if not sess then return true end
     if not sess.endTs then
-        accountUntil(endTs or os.time())
+        local stopAt = endTs or os.time()
+        if sess.paused then
+            -- Paused in the background: the time since the last tick isn't work.
+            sess.lastTs = math.max(sess.lastTs, stopAt)
+        else
+            accountUntil(stopAt)
+        end
         sess.endTs = endTs or sess.lastTs
         if extraNote and extraNote ~= "" then
             sess.note = (sess.note ~= "" and (sess.note .. " ") or "") .. extraNote
@@ -663,11 +748,15 @@ local function exportCSV()
         local list = groups[proj]
         table.sort(list, function(a, b) return (a.startTs or 0) < (b.startTs or 0) end)
 
+        -- A flat-fee project earns its fee: sessions show the target rate but no
+        -- earnings of their own, and the subtotal carries the fee.
+        local fee = feeFor(proj)
         local pSecs, pEarn, pPages = 0, {}, {}
         for _, s in ipairs(list) do
-            local earn = sessionEarnings(s)
             pSecs = pSecs + (s.seconds or 0)
-            addEarnings(pEarn, s); addEarnings(gTotEarn, s)
+            if not fee then addEarnings(pEarn, s); addEarnings(gTotEarn, s) end
+            local note = (s.note or "") .. (s.manual and " (manual entry)" or "")
+                .. (s.edited and " (edited)" or "")
             local row = {
                 csvField(s.project),
                 os.date("%Y-%m-%d", s.startTs),
@@ -677,8 +766,8 @@ local function exportCSV()
                 string.format("%.4f", (s.seconds or 0) / 3600),
                 fmtMoney(s.rate),
                 csvField(s.currency),
-                fmtMoney(earn),
-                csvField(s.note),
+                fee and "" or fmtMoney(sessionEarnings(s)),
+                csvField((note:gsub("^%s+", ""))),
             }
             for _, p in ipairs(pageCols) do
                 local secs = s.pages and s.pages[p] or 0
@@ -696,6 +785,14 @@ local function exportCSV()
         sub[6] = string.format("%.4f", pSecs / 3600)
         local pc = pageCells(pPages)
         for i = 1, #pc do sub[10 + i] = pc[i] end
+        if fee then
+            local _, currency = rateFor(proj)
+            pEarn = { [currency] = fee }
+            gTotEarn[currency] = (gTotEarn[currency] or 0) + fee
+            sub[10] = csvField("Flat fee. Effective rate " .. (pSecs > 0
+                and (currency .. " " .. fmtMoney(fee / (pSecs / 3600)) .. " / hr")
+                or "n/a"))
+        end
         addSummary(sub, pEarn)
         lines[#lines + 1] = table.concat(blankRow(), ",") -- spacer between projects
 
@@ -723,6 +820,128 @@ local function exportCSV()
     local closed = f:close()
     if not written or not closed then os.remove(path); return nil end
     return path
+end
+
+-- ---------------------------------------------------------------------------
+-- Client timesheet: one project's hours and notes, no rates or earnings.
+-- A printable HTML page (print it to PDF) plus the same table as CSV.
+-- ---------------------------------------------------------------------------
+local TRACKER_TAGS = { "%(auto%-stopped: idle%)", "%(project switched%)", "%(recovered[^)]*%)",
+                       "%(in progress%)", "%(save pending%)" }
+
+-- Notes as the client should see them: without the tracker's own tags.
+local function clientNote(note)
+    note = note or ""
+    for _, tag in ipairs(TRACKER_TAGS) do note = note:gsub("%s*" .. tag, "") end
+    return (note:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function htmlEscape(text)
+    return (tostring(text or ""):gsub("[&<>\"']", {
+        ["&"] = "&amp;", ["<"] = "&lt;", [">"] = "&gt;", ['"'] = "&quot;", ["'"] = "&#39;" }))
+end
+
+-- Lua opens files through the system code page on Windows, so keep file
+-- names ASCII; the project name inside the files keeps its real spelling.
+local function fileSafe(name)
+    local safe = name:gsub("[^%w%-_ ]", "_"):gsub("%s+", " "):gsub("^[ _]+", ""):gsub("[ _]+$", "")
+    if safe == "" then safe = "Project" end
+    return safe:sub(1, 60)
+end
+
+local function pageLabel(page)
+    if page == "unknown" then return "Other" end
+    if page == "manual" then return "Added manually" end
+    return page:sub(1, 1):upper() .. page:sub(2)
+end
+
+local function writeText(path, text)
+    local f = io.open(path, "wb")
+    if not f then return false end
+    local written = f:write(text)
+    local closed = f:close()
+    if not written or not closed then os.remove(path); return false end
+    return true
+end
+
+local function exportClientTimesheet(projName)
+    local list = {}
+    for _, s in ipairs(sessions) do
+        if s.project == projName and (s.seconds or 0) > 0 then list[#list + 1] = s end
+    end
+    if sess and sess.project == projName and sess.seconds > 0 then
+        list[#list + 1] = { startTs = sess.startTs, endTs = sess.endTs or sess.lastTs,
+                            seconds = sess.seconds, note = sess.note, pages = sess.pages }
+    end
+    if #list == 0 then return nil, "No time tracked on this project yet." end
+    table.sort(list, function(a, b) return (a.startTs or 0) < (b.startTs or 0) end)
+
+    local total, stages = 0, {}
+    local csv = { "Date,Start,End,Duration,Hours,Notes" }
+    local rows = {}
+    for _, s in ipairs(list) do
+        total = total + s.seconds
+        for page, secs in pairs(s.pages or {}) do stages[page] = (stages[page] or 0) + secs end
+        local date, from = os.date("%Y-%m-%d", s.startTs), os.date("%H:%M", s.startTs)
+        local to, note = os.date("%H:%M", s.endTs or s.startTs), clientNote(s.note)
+        csv[#csv + 1] = table.concat({ date, from, to, fmtHMS(s.seconds),
+            string.format("%.2f", s.seconds / 3600), csvField(note) }, ",")
+        rows[#rows + 1] = string.format(
+            "<tr><td>%s</td><td>%s to %s</td><td class=\"num\">%s</td><td>%s</td></tr>",
+            date, from, to, fmtHMS(s.seconds), htmlEscape(note))
+    end
+    local hours = string.format("%.2f", total / 3600)
+    csv[#csv + 1] = table.concat({ "Total", "", "", fmtHMS(total), hours, "" }, ",")
+
+    local stageOrder, seen = {}, {}
+    for _, p in ipairs(PAGES) do stageOrder[#stageOrder + 1] = p; seen[p] = true end
+    for p in pairs(stages) do if not seen[p] then stageOrder[#stageOrder + 1] = p end end
+    local stageRows = {}
+    for _, p in ipairs(stageOrder) do
+        local secs = stages[p] or 0
+        if secs > 0 then
+            stageRows[#stageRows + 1] = string.format(
+                "<tr><td>%s</td><td class=\"num\">%s</td><td class=\"num\">%d%%</td></tr>",
+                htmlEscape(pageLabel(p)), fmtHMS(secs), math.floor(secs / total * 100 + 0.5))
+        end
+    end
+
+    local first, last = os.date("%Y-%m-%d", list[1].startTs), os.date("%Y-%m-%d", list[#list].startTs)
+    local html = table.concat({
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+        "<title>Timesheet: ", htmlEscape(projName), "</title><style>",
+        "body{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;color:#222;",
+        "margin:40px auto;max-width:820px;padding:0 24px}",
+        "h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:28px 0 0}",
+        ".muted{color:#666;font-size:14px}",
+        "table{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px}",
+        "th,td{text-align:left;padding:7px 8px;border-bottom:1px solid #ddd;vertical-align:top}",
+        "th{background:#f4f4f4}.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}",
+        "tfoot td{font-weight:700;border-top:2px solid #222;border-bottom:none}",
+        "@media print{body{margin:0;padding:0}}</style></head><body>",
+        "<h1>Timesheet: ", htmlEscape(projName), "</h1>",
+        "<div class=\"muted\">", first, first ~= last and (" to " .. last) or "",
+        " &middot; ", #list, #list == 1 and " session" or " sessions",
+        " &middot; ", hours, " hours</div>",
+        "<table><thead><tr><th>Date</th><th>Time</th><th class=\"num\">Duration</th>",
+        "<th>Notes</th></tr></thead><tbody>", table.concat(rows),
+        "</tbody><tfoot><tr><td colspan=\"2\">Total</td><td class=\"num\">", fmtHMS(total),
+        "</td><td>", hours, " hours</td></tr></tfoot></table>",
+        #stageRows > 0 and ("<h2>Time by stage</h2><table><tbody>" .. table.concat(stageRows)
+            .. "</tbody></table>") or "",
+        "<p class=\"muted\">Prepared ", os.date("%Y-%m-%d"), ".</p></body></html>\n",
+    })
+
+    local base = DATA_DIR .. SEP .. "Timesheet_" .. fileSafe(projName) .. os.date("_%Y%m%d_%H%M%S")
+    local htmlPath, suffix = base .. ".html", 1
+    while exists(htmlPath) do htmlPath = base .. "_" .. suffix .. ".html"; suffix = suffix + 1 end
+    local csvPath = htmlPath:gsub("%.html$", ".csv")
+    if not writeText(htmlPath, html)
+        or not writeText(csvPath, "\239\187\191" .. table.concat(csv, "\r\n") .. "\r\n") then
+        os.remove(htmlPath)
+        return nil, "Could not write the timesheet. Check disk space and permissions."
+    end
+    return htmlPath
 end
 
 -- ---------------------------------------------------------------------------
@@ -755,20 +974,33 @@ local function pageRow(p)
     })
 end
 
+-- Settings form building blocks (see the form in the window below)
+local FORM_LABEL_W = 70
+local function formLabel(text)
+    return ui:Label({ Text = text, Weight = 0, MinimumSize = { FORM_LABEL_W, 0 },
+                      MaximumSize = { FORM_LABEL_W, 32 } })
+end
+local function formCol(...)
+    local col = { Weight = 1, Spacing = 4 }
+    for i, item in ipairs({ ... }) do col[i] = item end
+    return ui:HGroup(col)
+end
+local function formRow(left, right)
+    return ui:HGroup({ Weight = 0, Spacing = 16, left, right })
+end
+
 local pagesBox = { ID = "PagesBox", Weight = 0, Spacing = 3 }
 for _, p in ipairs(PAGES) do pagesBox[#pagesBox + 1] = pageRow(p) end
 
 local win = disp:AddWindow({
     ID = "ttwin",
     WindowTitle = "Time Tracker",
-    Geometry = { 300, 100, 480, 760 },
+    Geometry = { 300, 60, 480, 780 },
 
     ui:VGroup({
         ID = "root",
         Spacing = 6,
 
-        ui:Label({ ID = "TitleLbl", Text = "TIME TRACKER", Weight = 0,
-                   Alignment = { AlignHCenter = true } }),
         ui:Label({ ID = "ProjectLbl", Text = "", Weight = 0,
                    Alignment = { AlignHCenter = true } }),
         ui:Label({ ID = "TimeLbl", Text = "0:00:00", Weight = 0,
@@ -782,19 +1014,46 @@ local win = disp:AddWindow({
         ui:LineEdit({ ID = "NoteEdit", Weight = 0,
                       PlaceholderText = "Session note (optional, saved when you stop)" }),
 
-        ui:HGroup({
-            Weight = 0,
-            ui:Label({ ID = "RateLbl", Text = "Rate / hr", Weight = 0 }),
-            ui:ComboBox({ ID = "CurCombo", Weight = 0, MinimumSize = { 55, 24 },
-                          ToolTip = "Currency for new sessions. Stop tracking to change it." }),
-            ui:LineEdit({ ID = "RateEdit", Text = fmtMoney(settings.rate), Weight = 1,
-                          ToolTip = "Hourly rate for new sessions. Stop tracking to change it." }),
-            ui:Label({ ID = "IdleLbl", Text = "  Idle stop (min)", Weight = 0 }),
-            ui:LineEdit({ ID = "IdleEdit", Text = tostring(settings.idleMin),
-                          Weight = 0, MinimumSize = { 45, 24 } }),
-        }),
-        ui:CheckBox({ ID = "AutoStartChk", Weight = 0, Checked = settings.autoStart,
-                      Text = "Start tracking automatically when this window opens" }),
+        -- Settings form: two equal columns; fixed-width labels and short
+        -- fields keep every row aligned at any window width.
+        formRow(
+            formCol(
+                formLabel("Rate / hr"),
+                ui:ComboBox({ ID = "CurCombo", Weight = 0, MinimumSize = { 58, 24 },
+                              MaximumSize = { 58, 32 },
+                              ToolTip = "Currency for new sessions. Stop tracking to change it." }),
+                ui:LineEdit({ ID = "RateEdit", Text = fmtMoney(settings.rate), Weight = 1,
+                              ToolTip = "Hourly rate for new sessions. Stop tracking to change it." })),
+            formCol(
+                formLabel("Flat fee"),
+                ui:LineEdit({ ID = "FeeEdit", Weight = 1, PlaceholderText = "none, billed hourly",
+                              ToolTip = "A fixed price for this project. Your hourly rate then "
+                                  .. "becomes the target: you see how much time is left before "
+                                  .. "the fee stops paying that rate, and what you actually earn "
+                                  .. "per hour. Leave empty to bill hourly." }))),
+        formRow(
+            formCol(
+                formLabel("Idle stop"),
+                ui:LineEdit({ ID = "IdleEdit", Text = tostring(settings.idleMin), Weight = 0,
+                              MinimumSize = { 58, 24 }, MaximumSize = { 58, 32 },
+                              ToolTip = "Minutes without mouse or keyboard input before the "
+                                  .. "session stops at your last input. 0 turns it off." }),
+                ui:Label({ Text = "min", Weight = 1 })),
+            formCol(
+                ui:CheckBox({ ID = "AutoStartChk", Weight = 1, Checked = settings.autoStart,
+                              Text = "Start when opened",
+                              ToolTip = "Start tracking automatically whenever this window opens." }))),
+        formRow(
+            formCol(
+                ui:CheckBox({ ID = "RenderChk", Weight = 1, Checked = settings.countRenders,
+                              Text = "Count renders",
+                              ToolTip = "Keep counting while Resolve renders, even if you step "
+                                  .. "away (idle stop waits until the render ends)." })),
+            formCol(
+                ui:CheckBox({ ID = "FocusChk", Weight = 1, Checked = settings.pauseInBackground,
+                              Text = "Pause in background",
+                              ToolTip = "Don't count time while another app is in front. The "
+                                  .. "session continues when you switch back to Resolve." }))),
 
         ui:Label({ ID = "OverviewLbl", Text = "OVERVIEW", Weight = 0 }),
         ui:HGroup({
@@ -809,6 +1068,13 @@ local win = disp:AddWindow({
             ui:Label({ ID = "EarnLbl", Text = "0.00", Weight = 1,
                        Alignment = { AlignRight = true, AlignVCenter = true } }),
         }),
+        -- Always shown: hidden widgets keep their space in Fusion layouts.
+        ui:HGroup({
+            Weight = 0,
+            ui:Label({ ID = "BudgetCap", Text = "Time budget", Weight = 0 }),
+            ui:Label({ ID = "BudgetLbl", Text = "", Weight = 1,
+                       Alignment = { AlignRight = true, AlignVCenter = true } }),
+        }),
 
         ui:Label({ ID = "PagesCap", Text = "WHERE YOUR TIME GOES", Weight = 0 }),
         ui:VGroup(pagesBox),
@@ -816,20 +1082,70 @@ local win = disp:AddWindow({
         ui:Label({ ID = "AllLbl", Text = "", Weight = 0,
                    Alignment = { AlignHCenter = true } }),
 
-        ui:Label({ ID = "HistCap", Text = "SESSION HISTORY", Weight = 0 }),
+        ui:HGroup({
+            Weight = 0,
+            ui:Label({ ID = "HistCap", Text = "SESSION HISTORY", Weight = 1 }),
+            ui:Button({ ID = "AddBtn", Text = "Add", Weight = 0,
+                        ToolTip = "Add time worked outside Resolve to this project" }),
+            ui:Button({ ID = "EditBtn", Text = "Edit", Weight = 0,
+                        ToolTip = "Change the selected session" }),
+            ui:Button({ ID = "DeleteBtn", Text = "Delete", Weight = 0,
+                        ToolTip = "Delete the selected session (click twice)" }),
+        }),
         ui:Tree({ ID = "HistTree", Weight = 1 }),
 
         ui:HGroup({
             Weight = 0,
-            ui:Button({ ID = "ExportBtn", Text = "Export CSV" }),
+            ui:Button({ ID = "ExportBtn", Text = "Export CSV",
+                        ToolTip = "All projects, with rates and earnings, for your records" }),
+            ui:Button({ ID = "ClientBtn", Text = "Client Timesheet",
+                        ToolTip = "This project's hours and notes without rates, as a "
+                            .. "printable page (print to PDF) and a CSV" }),
             ui:Button({ ID = "FolderBtn", Text = "Open Folder" }),
-            ui:Button({ ID = "DeleteBtn", Text = "Delete Selected" }),
             ui:Button({ ID = "CloseBtn", Text = "Close" }),
         }),
     }),
 })
 
 local itm = win:GetItems()
+
+-- Entry editor: add time worked outside Resolve, or correct a session.
+-- A second window is safe when Resolve quits: it tears the window down once
+-- the main loop has ended, without sending it a Close event (verified live).
+local function editorRow(label, id, placeholder)
+    return ui:HGroup({
+        Weight = 0,
+        ui:Label({ Text = label, Weight = 0, MinimumSize = { 78, 0 } }),
+        ui:LineEdit({ ID = id, Weight = 1, PlaceholderText = placeholder }),
+    })
+end
+local editWin = disp:AddWindow({
+    ID = "EditWin",
+    WindowTitle = "Time Tracker entry",
+    Geometry = { 360, 220, 380, 270 },
+    ui:VGroup({
+        Spacing = 6,
+        ui:Label({ ID = "EdTitle", Text = "", Weight = 0, WordWrap = true }),
+        editorRow("Date", "EdDate", "YYYY-MM-DD"),
+        editorRow("Start", "EdStart", "HH:MM"),
+        editorRow("Duration", "EdDur", "H:MM, or hours such as 1.5"),
+        editorRow("Rate / hr", "EdRate", "hourly rate"),
+        editorRow("Note", "EdNote", "what was done"),
+        ui:Label({ ID = "EdStatus", Text = "", Weight = 0, WordWrap = true }),
+        ui:HGroup({
+            Weight = 0,
+            ui:Button({ ID = "EdSave", Text = "Save" }),
+            ui:Button({ ID = "EdCancel", Text = "Cancel" }),
+        }),
+    }),
+})
+local eitm = editWin:GetItems()
+
+if not focus.supported then
+    itm.FocusChk.Enabled = false
+    itm.FocusChk.Checked = false
+    itm.FocusChk.ToolTip = "Available on Windows for now."
+end
 
 -- Currency combo
 itm.CurCombo:AddItems(CURRENCIES)
@@ -869,7 +1185,9 @@ refreshHistory = function()
             local it = itm.HistTree:NewItem()
             it.Text[0] = os.date("%Y-%m-%d %H:%M", s.startTs)
             it.Text[1] = fmtHMS(s.seconds)
-            it.Text[2] = (s.currency or "") .. " " .. fmtMoney(sessionEarnings(s))
+            -- A flat-fee project earns its fee, not per session.
+            it.Text[2] = feeFor(projName) and ""
+                or ((s.currency or "") .. " " .. fmtMoney(sessionEarnings(s)))
             it.Text[3] = s.note or ""
             -- Hidden per-row data: Qt stretches the last column, so a
             -- zero-width ID column would still show.
@@ -919,15 +1237,46 @@ local function refreshPages()
     end
 end
 
+-- Flat-fee projects: the fee is the earnings; the hourly rate becomes the
+-- target, giving a time budget (fee / rate) and an effective hourly rate
+-- (fee / hours worked). nil for projects billed hourly.
+local BUDGET_OK, BUDGET_WARN, BUDGET_OVER, BUDGET_NONE =
+    "color: rgb(63,185,80);", "color: rgb(230,170,40);", "color: rgb(230,82,82);",
+    "color: rgb(120,120,120);"
+local function flatFeeSummary(projName, totalSecs)
+    local fee = feeFor(projName)
+    if not fee then return nil end
+    local rate, currency = rateFor(projName)
+    -- Effective rate: what the fee pays per hour actually worked so far.
+    local summary = { earnings = currency .. " " .. fmtMoney(fee) .. " flat fee" .. (totalSecs > 0
+        and (" · " .. currency .. " " .. fmtMoney(fee / (totalSecs / 3600)) .. " / hr") or "") }
+    if rate and rate > 0 then
+        local budget = fee / rate * 3600
+        local used = budget > 0 and totalSecs / budget or 0
+        if totalSecs <= budget then
+            summary.budget = fmtHMS(budget - totalSecs) .. " left of " .. fmtHMS(budget)
+        else
+            summary.budget = fmtHMS(totalSecs - budget) .. " over the " .. fmtHMS(budget) .. " budget"
+        end
+        summary.budgetStyle = used > 1 and BUDGET_OVER or used >= 0.8 and BUDGET_WARN or BUDGET_OK
+    else
+        summary.budget = "set your hourly rate to get one"
+        summary.budgetStyle = BUDGET_NONE
+    end
+    return summary
+end
+
 -- Show the rate that applies: the running session's, else the one the open
 -- project was last tracked with. An unknown project keeps the last-used rate.
 local rateShownFor = nil
 local function showProjectRate(projName)
     rateShownFor = projName
+    local fee = feeFor(projName)
+    itm.FeeEdit.Text = fee and fmtMoney(fee) or ""
     local rate, currency
     if sess and sess.project == projName then
         rate, currency = sess.rate, sess.currency
-    elseif settings.projectRates[projName] then
+    elseif settings.projects[projName] and settings.projects[projName].rate then
         rate, currency = rateFor(projName)
     else
         return
@@ -946,8 +1295,12 @@ local function refreshUI()
     if rateShownFor ~= rateProject then showProjectRate(rateProject) end
     setProp("ProjectLbl", "Text", projName)
     setProp("TimeLbl", "Text", fmtHMS(sess and sess.seconds or 0))
-    setProp("TotalLbl", "Text", fmtHMS(projectTotalSeconds(projName)))
-    setProp("EarnLbl", "Text", projectEarnings(projName))
+    local totalSecs = projectTotalSeconds(projName)
+    setProp("TotalLbl", "Text", fmtHMS(totalSecs))
+    local flat = flatFeeSummary(projName, totalSecs)
+    setProp("EarnLbl", "Text", flat and flat.earnings or projectEarnings(projName))
+    setProp("BudgetLbl", "Text", flat and flat.budget or "set a flat fee to get one")
+    setProp("BudgetLbl", "StyleSheet", flat and flat.budgetStyle or BUDGET_NONE)
     refreshPages()
     local today, week = rangeTotals()
     setProp("AllLbl", "Text", "All projects · Today " .. fmtHMS(today)
@@ -993,10 +1346,14 @@ local function pullSettings(lenient, quiet)
     settings.currency = CURRENCIES[itm.CurCombo.CurrentIndex + 1] or settings.currency
     settings.idleMin = idleMin or settings.idleMin
     settings.autoStart = itm.AutoStartChk.Checked and true or false
+    settings.countRenders = itm.RenderChk.Checked and true or false
+    settings.pauseInBackground = itm.FocusChk.Checked and true or false
     if not lenient then
         -- Start: this is now the rate for the open project.
-        settings.projectRates[currentProjectName()] =
-            { rate = settings.rate, currency = settings.currency }
+        local name = currentProjectName()
+        local p = settings.projects[name] or {}
+        p.rate, p.currency = settings.rate, settings.currency
+        settings.projects[name] = p
     end
     if not saveSettings() then
         if not quiet then refreshUI() end
@@ -1005,16 +1362,62 @@ local function pullSettings(lenient, quiet)
     return true
 end
 
+-- The flat fee belongs to the project, not to a session, so it can change at
+-- any time. TextChanged fires per keystroke (and when the field is filled in
+-- for another project); save once on the next tick, and only real changes.
+local feeDirty = false
+local function saveFee(quiet)
+    feeDirty = false
+    local text = (itm.FeeEdit.Text or ""):gsub("%s", "")
+    local fee = nil
+    if text ~= "" then
+        fee = nonnegative(text)
+        if not fee then
+            if not quiet then
+                itm.StatusLbl.Text = "Enter the flat fee as a number, or leave it empty to bill hourly."
+            end
+            return false
+        end
+        if fee == 0 then fee = nil end
+    end
+    -- The project whose values the fields show (see showProjectRate).
+    local name = rateShownFor or currentProjectName()
+    if feeFor(name) == fee then return true end
+    local p = settings.projects[name] or {}
+    p.fee = fee
+    settings.projects[name] = next(p) and p or nil
+    if not saveSettings() then
+        if not quiet then refreshUI() end
+        return false
+    end
+    -- History rows show per-session earnings only for hourly projects.
+    if not quiet then refreshHistory() end
+    return true
+end
+
 -- ---------------------------------------------------------------------------
 -- Tick (fires every second while the window is open)
 -- ---------------------------------------------------------------------------
 local pausedInputTs = nil
+local lastRenderTs = nil -- last tick a counted render was running
 local function autoStopIdle(idleSecs, now)
     pausedInputTs = now - idleSecs
     local cutoff = trimAfter(now - math.floor(idleSecs))
     if closeSession("(auto-stopped: idle)", cutoff) then
         state = "armed"
         itm.StatusLbl.Text = "Auto-paused while you were away. Tracking resumes when you're back."
+    end
+end
+
+local BACKGROUND_NOTICE = "Paused while Resolve is in the background."
+local backgroundShown = false
+local function showBackgroundNotice(on)
+    if on == backgroundShown then return end
+    backgroundShown = on
+    if on then
+        itm.StatusLbl.Text = BACKGROUND_NOTICE
+    elseif itm.StatusLbl.Text == BACKGROUND_NOTICE then
+        itm.StatusLbl.Text = ""
     end
 end
 
@@ -1035,9 +1438,29 @@ local function tick()
         if closeSession() then itm.StatusLbl.Text = "Session saved. Press Start to resume." end
     elseif state == "running" and sess then
         sess.note = itm.NoteEdit.Text or ""
-        accountUntil(now)
+        -- Optional: a render counts as work even with nobody at the desk.
+        local rendering = settings.countRenders and renderingNow()
+        -- Optional: while Resolve is in the background, skip the time since the
+        -- last tick instead of counting it. The session stays open, so a quick
+        -- look at another app does not split it.
+        local background = settings.pauseInBackground and focus.supported
+            and not rendering and not focus.resolveActive()
+        sess.paused = background or nil
+        if background then
+            sess.lastTs = math.max(sess.lastTs, now)
+        else
+            accountUntil(now)
+        end
+        showBackgroundNotice(background)
         local thr = nonnegative(itm.IdleEdit.Text, settings.idleMin) * 60
         local idleSecs = idle.supported and idle.seconds() or 0
+        -- A counted render is activity: idle time starts when it ends, so the
+        -- rewind after an idle stop never removes the render itself.
+        if rendering then
+            lastRenderTs, idleSecs = now, 0
+        elseif lastRenderTs then
+            idleSecs = math.min(idleSecs, now - lastRenderTs)
+        end
         if idle.supported and thr > 0 and idleSecs >= thr then
             autoStopIdle(idleSecs, now)
         else
@@ -1077,6 +1500,8 @@ local function tick()
             startSession(currentProjectName())
         end
     end
+    if state ~= "running" then showBackgroundNotice(false) end
+    if feeDirty then saveFee() end
     refreshUI()
 end
 
@@ -1140,17 +1565,178 @@ function win.On.AutoStartChk.Clicked(ev)
     if not saveSettings() then refreshUI() end
 end
 
+function win.On.RenderChk.Clicked(ev)
+    settings.countRenders = itm.RenderChk.Checked and true or false
+    if not saveSettings() then refreshUI() end
+end
+
+function win.On.FocusChk.Clicked(ev)
+    settings.pauseInBackground = focus.supported and itm.FocusChk.Checked and true or false
+    if not saveSettings() then refreshUI() end
+end
+
+function win.On.FeeEdit.TextChanged(ev) feeDirty = true end
+
+function win.On.ClientBtn.Clicked(ev)
+    if state == "running" then tick() end
+    local path, problem = exportClientTimesheet(currentProjectName())
+    if not path then itm.StatusLbl.Text = problem; return end
+    pcall(bmd.openfileexternal, "Open", path) -- shows it in the browser, ready to print
+    itm.StatusLbl.Text = "Saved " .. path:match("[^\\/]+$")
+        .. " and a matching CSV. Print the page to save a PDF."
+end
+
+local function selectedRow()
+    local it = itm.HistTree:CurrentItem()
+    if not it then
+        local ok, selected = pcall(function() return itm.HistTree:SelectedItems() end)
+        it = ok and selected and selected[1] or nil
+    end
+    return it
+end
+
+local function findSession(id)
+    for i, s in ipairs(sessions) do
+        if s.id == id then return s, i end
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Adding and editing entries
+-- ---------------------------------------------------------------------------
+local editing = nil -- { id = session id } when editing, {} when adding
+
+local function parseDuration(text)
+    text = (text or ""):gsub("%s", "")
+    local h, m, s = text:match("^(%d+):(%d%d):(%d%d)$")
+    if not h then h, m = text:match("^(%d+):(%d%d)$"); s = "0" end
+    if h then
+        h, m, s = tonumber(h), tonumber(m), tonumber(s)
+        if m >= 60 or s >= 60 then return nil end
+        return h * 3600 + m * 60 + s
+    end
+    local hours = nonnegative(text)
+    return hours and math.floor(hours * 3600 + 0.5) or nil
+end
+
+-- Rescales recorded page time to a new duration; the remainder goes to the
+-- biggest page so the parts always add up to the whole.
+local function scalePages(pages, from, to)
+    if not pages or from <= 0 or not next(pages) then return { manual = to } end
+    local out, used, biggest = {}, 0, nil
+    for page, secs in pairs(pages) do
+        local v = math.floor(secs * to / from)
+        out[page], used = v, used + v
+        if not biggest or secs > pages[biggest] then biggest = page end
+    end
+    out[biggest] = out[biggest] + (to - used)
+    return out
+end
+
+local function openEditor(s)
+    local projName = currentProjectName()
+    editing = s and { id = s.id } or {}
+    local startTs = s and s.startTs or (os.time() - 3600)
+    local rate = s and s.rate or rateFor(projName)
+    eitm.EdTitle.Text = s and ("Edit a session of " .. projName)
+        or ("Add time worked outside Resolve to " .. projName)
+    eitm.EdDate.Text = os.date("%Y-%m-%d", startTs)
+    eitm.EdStart.Text = os.date("%H:%M", startTs)
+    eitm.EdDur.Text = s and fmtHMS(s.seconds) or "1:00"
+    eitm.EdRate.Text = fmtMoney(rate)
+    eitm.EdNote.Text = s and (s.note or "") or ""
+    eitm.EdStatus.Text = ""
+    editWin:Show()
+    pcall(function() editWin:Raise() end)
+end
+
+function win.On.AddBtn.Clicked(ev) openEditor(nil) end
+
+function win.On.EditBtn.Clicked(ev)
+    local it = selectedRow()
+    local s = it and findSession(it:GetData(0, "UserRole"))
+    if not s then
+        itm.StatusLbl.Text = "Select a session in the history to edit it."
+        return
+    end
+    openEditor(s)
+end
+
+local function closeEditor()
+    editing = nil
+    editWin:Hide()
+end
+
+function editWin.On.EdCancel.Clicked(ev) closeEditor() end
+function editWin.On.EditWin.Close(ev) closeEditor() end
+
+function editWin.On.EdSave.Clicked(ev)
+    if not editing then return end
+    local function problem(text) eitm.EdStatus.Text = text end
+    local y, mo, d = (eitm.EdDate.Text or ""):match("^%s*(%d%d%d%d)%-(%d%d?)%-(%d%d?)%s*$")
+    local hh, mi = (eitm.EdStart.Text or ""):match("^%s*(%d%d?):(%d%d)%s*$")
+    if not y then return problem("Enter the date as YYYY-MM-DD.") end
+    if not hh or tonumber(hh) > 23 or tonumber(mi) > 59 then
+        return problem("Enter the start time as HH:MM.")
+    end
+    local startTs = os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+                              hour = tonumber(hh), min = tonumber(mi), sec = 0 })
+    local check = os.date("*t", startTs)
+    if check.month ~= tonumber(mo) or check.day ~= tonumber(d) then
+        return problem("That date does not exist.")
+    end
+    local seconds = parseDuration(eitm.EdDur.Text)
+    if not seconds or seconds <= 0 or seconds > 24 * 3600 then
+        return problem("Enter a duration such as 1:30 or 1.5 (at most 24 hours).")
+    end
+    local rate = nonnegative(eitm.EdRate.Text)
+    if not rate then return problem("Enter a non-negative hourly rate.") end
+    local note = eitm.EdNote.Text or ""
+
+    local projName = currentProjectName()
+    if editing.id then
+        local s = findSession(editing.id)
+        if not s then return problem("That session no longer exists.") end
+        local before = {}
+        for k, v in pairs(s) do before[k] = v end
+        if startTs ~= s.startTs or seconds ~= s.seconds then
+            -- Calendar totals then spread the time across the new span.
+            s.pages = scalePages(s.pages, s.seconds or 0, seconds)
+            s.segments = nil
+            s.startTs, s.endTs, s.seconds = startTs, startTs + seconds, seconds
+        end
+        s.rate, s.note, s.edited = rate, note, true
+        if not saveSessions() then
+            for k in pairs(s) do s[k] = nil end
+            for k, v in pairs(before) do s[k] = v end
+            return problem("Could not save. Check disk space and permissions.")
+        end
+        itm.StatusLbl.Text = "Session updated."
+    else
+        local _, currency = rateFor(projName)
+        sessions[#sessions + 1] = {
+            id = newId(), project = projName, startTs = startTs, endTs = startTs + seconds,
+            seconds = seconds, rate = rate, currency = currency, note = note,
+            pages = { manual = seconds }, manual = true,
+        }
+        if not saveSessions() then
+            table.remove(sessions)
+            return problem("Could not save. Check disk space and permissions.")
+        end
+        itm.StatusLbl.Text = "Added " .. fmtHMS(seconds) .. " to " .. projName .. "."
+    end
+    closeEditor()
+    refreshHistory()
+    refreshUI()
+end
+
 -- Deleting billable history cannot be undone, so it takes a second click on
 -- the same row within a few seconds.
 local DELETE_CONFIRM_S = 5
 local pendingDelete = nil -- {id=, at=}
 
 function win.On.DeleteBtn.Clicked(ev)
-    local it = itm.HistTree:CurrentItem()
-    if not it then
-        local ok, selected = pcall(function() return itm.HistTree:SelectedItems() end)
-        it = ok and selected and selected[1] or nil
-    end
+    local it = selectedRow()
     if not it then
         itm.StatusLbl.Text = "Select a session in the history first."
         return
@@ -1159,7 +1745,7 @@ function win.On.DeleteBtn.Clicked(ev)
     if not (pendingDelete and pendingDelete.id == id
             and now - pendingDelete.at <= DELETE_CONFIRM_S) then
         pendingDelete = { id = id, at = now }
-        itm.StatusLbl.Text = "Click Delete Selected again to remove the "
+        itm.StatusLbl.Text = "Click Delete again to remove the "
             .. it.Text[1] .. " session from " .. it.Text[0] .. "."
         return
     end
@@ -1198,6 +1784,7 @@ local function shutdown(byWindowClose)
         -- Closing by X or with Resolve: the window cannot stay. A session whose
         -- history save failed is frozen in live.lua and recovered next time.
     end
+    if feeDirty then saveFee(byWindowClose) end
     pullSettings(true, byWindowClose)
     ticker:Stop()
     if not byWindowClose then win:Hide() end
