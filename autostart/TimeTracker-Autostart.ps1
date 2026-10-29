@@ -8,18 +8,21 @@
 #
 # Requires DaVinci Resolve Studio with
 #   Preferences > System > General > External scripting using: Local
-# Log: %LOCALAPPDATA%\ResolveTimeTracker\autostart.log
+# Log: ~\.resolve_time_tracker\autostart\autostart.log
 param(
     # A Resolve path map (resolved by Resolve itself, so a non-ASCII user name
     # never passes through a command line) or a full path for testing.
     [string]$Script = 'Scripts:/Utility/Time Tracker.lua',
-    [int]$PollSeconds = 5
+    [int]$PollSeconds = 3
 )
 $ErrorActionPreference = 'Continue'
 $MaxLaunchAttempts = 3
 $IdlePollSeconds = 60   # once scripting looks unavailable for this Resolve
 
-$stateDir = Join-Path $env:LOCALAPPDATA 'ResolveTimeTracker'
+# Next to the tracker's own data. Not under AppData: Windows redirects new
+# AppData folders created by packaged (MSIX) apps into the app's private
+# storage, where Task Scheduler cannot see them.
+$stateDir = Join-Path $env:USERPROFILE '.resolve_time_tracker\autostart'
 New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
 $logFile = Join-Path $stateDir 'autostart.log'
 function Write-Log([string]$message) {
@@ -96,8 +99,13 @@ while ($true) {
                 $done = $true
             }
             else {
-                # GetCurrentPage is empty while the Project Manager is showing.
-                $out = Invoke-Lua $fuscript "local r = bmd.scriptapp('Resolve'); print('TT_PAGE=' .. tostring(r and r:GetCurrentPage()))"
+                # GetCurrentPage is empty while the Project Manager (or a dialog
+                # such as Software Update) is showing. TT_NOSCRIPT means no
+                # scripting connection at all, which is the only case worth
+                # slowing down for: a Project Manager left open must not delay
+                # the tracker once a project opens.
+                $out = Invoke-Lua $fuscript ("local r = bmd.scriptapp('Resolve'); " +
+                    "if not r then print('TT_NOSCRIPT') else print('TT_PAGE=' .. tostring(r:GetCurrentPage())) end")
                 if ($out -match 'TT_PAGE=(\w+)' -and $Matches[1] -ne 'nil') {
                     $page = $Matches[1]
                     # Run inside Resolve, like the Scripts menu: the tracker belongs
@@ -122,10 +130,10 @@ while ($true) {
                     }
                     else { Write-Log "opening the tracker failed (attempt $attempts); retrying" }
                 }
-                elseif ((Get-Date) -gt $since.AddMinutes(3)) {
+                elseif ($out -notmatch 'TT_PAGE=' -and (Get-Date) -gt $since.AddMinutes(3)) {
                     if (-not $warned) {
-                        Write-Log ('no project visible to scripting after 3 minutes. If a project is open, ' +
-                            'set Preferences > System > General > External scripting using: Local (Resolve Studio)')
+                        Write-Log ('no scripting connection to Resolve after 3 minutes. Needs Resolve Studio with ' +
+                            'Preferences > System > General > External scripting using: Local')
                         $warned = $true
                     }
                     $delay = $IdlePollSeconds

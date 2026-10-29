@@ -139,9 +139,10 @@ Use the shared folder instead of your personal one:
 ### Open it automatically with Resolve (Windows)
 
 Resolve has no setting to run a script at startup, so the installer can add a
-tiny helper to your Windows Startup folder. It waits in the background and, as
-soon as Resolve opens a project, opens the tracker exactly as the Scripts menu
-would. If you close the tracker, it stays closed until you restart Resolve.
+tiny helper that Windows Task Scheduler starts when you sign in (and restarts
+within 5 minutes if it ever stops). It waits in the background and, a few
+seconds after Resolve opens a project, opens the tracker exactly as the Scripts
+menu would. If you close the tracker, it stays closed until you restart Resolve.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Autostart
@@ -154,9 +155,11 @@ External scripting using** set to **Local**. Be aware that this Resolve setting
 lets any program running on your computer control Resolve through its scripting
 API (never other computers; that would be the *Network* option). Leave it off if
 you don't want that; the tracker still works from the Scripts menu without it.
-If the tracker doesn't appear, the helper's log at
-`%LOCALAPPDATA%\ResolveTimeTracker\autostart.log` says why. The helper shows up
-as *Time Tracker for DaVinci Resolve* in Task Manager's Startup apps.
+If the tracker doesn't appear, the helper's log says why: it is
+`autostart\autostart.log` in the data folder (**Open Folder**). The helper is
+the task *Time Tracker for DaVinci Resolve* in Task Scheduler and runs without
+any window. Updating from 1.1.0? Rerun `install.ps1 -Autostart` once: it
+replaces the old Startup-folder shortcut with the scheduled task.
 
 To have tracking start the moment the window appears, also tick **Start when
 opened** in the tracker.
